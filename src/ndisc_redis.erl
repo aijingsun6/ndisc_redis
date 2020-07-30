@@ -62,6 +62,7 @@ q(RE) ->
 %%%===================================================================
 
 init([]) ->
+  process_flag(trap_exit, true),
   ets:new(?ND_REDIS_ETS, [named_table]),
   K = cluster_nodes_key(),
   Node = node(),
