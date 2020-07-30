@@ -1,0 +1,16 @@
+[{kernel,
+  [
+        {logger_level, info}
+  ]},
+
+  {redis_global,
+      [
+        {redis, #{host=>"${REDIS_HOST}", port=> ${REDIS_PORT}, password=> "${REDIS_PASSWORD}", database=>${REDIS_DB}, size => ${REDIS_POOL_SIZE}}}
+      ]
+    },
+  {ndisc_redis,
+   [
+        {cluster_id,<<"${CLUSTER_ID}">> }
+   ]
+  }
+].

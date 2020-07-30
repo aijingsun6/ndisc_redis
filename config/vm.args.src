@@ -1,0 +1,7 @@
+-sname ndisc_redis
+
+-setcookie ${COOKIE}
+
++K true
+
++A30
