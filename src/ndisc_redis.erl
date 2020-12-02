@@ -4,8 +4,8 @@
 
 %% API
 -export([
-  start_link/0,
-  cluster_id/0,
+  start_link/1,
+  start_link/2,
   q/0,
   q/1
 ]).
@@ -26,19 +26,18 @@
 -record(state, {
   cluster_key,
   node_list = [],
-  is_master = false
+  is_remsh = false
 }).
 
 %%%===================================================================
 %%% API
 %%%===================================================================
 
-start_link() ->
-  gen_server:start_link({local, ?SERVER}, ?MODULE, [], []).
+start_link(CK) ->
+  start_link(?SERVER, CK).
 
-cluster_id() ->
-  {ok, V} = application:get_env(?MODULE, cluster_id),
-  V.
+start_link(Name, CK) when is_atom(Name), is_binary(CK) ->
+  gen_server:start_link({local, Name}, ?MODULE, [CK], []).
 
 q() ->
   case ets:lookup(?ND_REDIS_ETS, ?NODES_KEY) of
@@ -61,46 +60,28 @@ q(RE) ->
 %%% gen_server callbacks
 %%%===================================================================
 
-init([]) ->
+init([CK]) ->
   process_flag(trap_exit, true),
   ets:new(?ND_REDIS_ETS, [named_table]),
-  K = cluster_nodes_key(),
   Node = node(),
-  {ok, _} = redis_q(["SADD", K, erlang:atom_to_list(Node)]),
-  {ok, NL} = find_nodes(K),
-  ets:insert(?ND_REDIS_ETS, {?NODES_KEY, NL}),
-  IsMaster = is_master_node(Node),
-  case IsMaster of
+  case is_remsh_node(Node) of
     true ->
-      net_kernel:monitor_nodes(true, [{node_type, all}, nodedown_reason]),
-      {NL2, DeadList} = split_nodes(NL, [], []),
-      [redis_q(["SREM", K, erlang:atom_to_list(X)]) || X <- DeadList],
-      {ok, #state{cluster_key = K, node_list = NL2, is_master = IsMaster}};
+      {ok, #state{is_remsh = true, cluster_key = CK, node_list = []}};
     false ->
-      ML = lists:filter(fun is_master_node/1, NL),
-      true = lists:any(fun(X) -> net_adm:ping(X) =:= pong end, ML),
-      {ok, #state{cluster_key = K, node_list = NL, is_master = IsMaster}}
+      {ok, _} = redis_proxy:q(["SADD", CK, erlang:atom_to_binary(Node, utf8)]),
+      net_kernel:monitor_nodes(true, [{node_type, all}, nodedown_reason]),
+      {ok, L} = find_nodes_redis(CK),
+      {Live, Dead} = split_nodes(L, [], []),
+      remove_downs(CK, Dead),
+      L2 = remove_duplicate([Node | Live]),
+      ets:insert(?ND_REDIS_ETS, {?NODES_KEY, L2}),
+      {ok, #state{is_remsh = false, cluster_key = CK, node_list = L2}}
   end.
 
-handle_call(_Request, _From, State) ->
+handle_call(Request, _From, State) ->
+  ?LOG_WARNING("unhandled call msg:~w", [Request]),
   {reply, ok, State}.
 
-handle_cast({nodeup, Master, Node} = Msg, S) ->
-  ?LOG_WARNING("recv cast msg:~w", [Msg]),
-  S2 =
-    case is_master_node(Master) of
-      true -> handle_nodeup(Node, S);
-      false -> S
-    end,
-  {noreply, S2};
-handle_cast({nodedown, Master, Node} = Msg, S) ->
-  ?LOG_WARNING("recv cast msg:~w", [Msg]),
-  S2 =
-    case is_master_node(Master) of
-      true -> handle_nodedown(Node, S);
-      false -> S
-    end,
-  {noreply, S2};
 handle_cast(Request, State) ->
   ?LOG_WARNING("unhandled cast msg:~w", [Request]),
   {noreply, State}.
@@ -123,12 +104,12 @@ handle_info({nodedown, Node} = Msg, S) ->
   S2 = handle_nodedown(Node, S),
   {noreply, S2};
 handle_info(Info, State) ->
-  ?LOG_WARNING("unhandled msg:~w", [Info]),
+  ?LOG_WARNING("unhandled info msg:~w", [Info]),
   {noreply, State}.
 
 terminate(Reason, #state{cluster_key = K}) ->
-  ?LOG_INFO("terminate with ~p", [Reason]),
-  redis_q(["SREM", K, erlang:atom_to_list(node())]),
+  ?LOG_INFO("terminate with ~p,~p", [K, Reason]),
+  redis_proxy:q(["SREM", K, erlang:atom_to_list(node())]),
   ok.
 
 code_change(_OldVsn, State, _Extra) ->
@@ -138,16 +119,9 @@ code_change(_OldVsn, State, _Extra) ->
 %%% Internal functions
 %%%===================================================================
 
-redis_q(L) ->
-  redis_proxy:q(L).
-
-cluster_nodes_key() ->
-  ClusterId = cluster_id(),
-  lists:flatten(io_lib:format("~p_~ts", [?MODULE, ClusterId])).
-
-find_nodes(K) ->
-  case redis_q(["SMEMBERS", K]) of
-    {ok, L} ->
+find_nodes_redis(K) ->
+  case redis_proxy:q(["SMEMBERS", K]) of
+    {ok, L} when is_list(L) ->
       L2 = lists:map(fun(X) -> erlang:binary_to_atom(X, utf8) end, L),
       L3 = lists:usort(L2),
       {ok, L3};
@@ -155,21 +129,29 @@ find_nodes(K) ->
       Err
   end.
 
-split_nodes([], LiveAcc, DeadAcc) -> {LiveAcc, DeadAcc};
-split_nodes([N | L], LiveAcc, DeadAcc) when N =:= node() ->
-  split_nodes(L, [N | LiveAcc], DeadAcc);
+split_nodes([], LiveAcc, DeadAcc) ->
+  {LiveAcc, DeadAcc};
 split_nodes([N | L], LiveAcc, DeadAcc) ->
-  case net_adm:ping(N) of
-    pong -> split_nodes(L, [N | LiveAcc], DeadAcc);
-    pang -> split_nodes(L, LiveAcc, [N | DeadAcc])
+  case is_node_alive(N) of
+    true ->
+      split_nodes(L, [N | LiveAcc], DeadAcc);
+    false ->
+      split_nodes(L, LiveAcc, [N | DeadAcc])
   end.
 
-is_master_node(Node) when is_atom(Node) ->
-  case re:run(erlang:atom_to_list(Node), lists:flatten(io_lib:format("^~p@*", [?MODULE]))) of
-    match -> true;
-    {match, _} -> true;
-    _ -> false
+is_node_alive(N) when N =:= node() ->
+  true;
+is_node_alive(N) ->
+  case net_adm:ping(N) of
+    pong -> true;
+    pang -> false
   end.
+
+is_remsh_node(Node) when Node =:= node() ->
+  case catch init:get_argument(remsh) of
+    {ok, _} -> true;
+    _ -> false
+  end;
 
 is_remsh_node(Node) when is_atom(Node) ->
   case catch rpc:call(Node, init, get_argument, [remsh], 5000) of
@@ -179,44 +161,41 @@ is_remsh_node(Node) when is_atom(Node) ->
 
 handle_nodeup(Node, S) when is_atom(Node) ->
   handle_nodeup([Node], S);
-handle_nodeup(Nodes, #state{is_master = Master, node_list = NL} = S) when is_list(Nodes) ->
+handle_nodeup(Nodes, #state{node_list = NL} = S) when is_list(Nodes) ->
   Nodes2 = lists:filter(fun(X) -> not is_remsh_node(X) end, Nodes),
   case Nodes2 =:= [] of
     true ->
       S;
     false ->
-      NL2 = lists:usort(NL ++ Nodes2),
+      NL2 = remove_duplicate(NL ++ Nodes2),
       ets:insert(?ND_REDIS_ETS, {?NODES_KEY, NL2}),
-      case Master of
-        true ->
-          notify_node_change({nodeup, node(), Nodes2}, NL2);
-        false ->
-          pass
-      end,
       S#state{node_list = NL2}
   end.
 
 handle_nodedown(Node, S) when is_atom(Node) ->
   handle_nodedown([Node], S);
-handle_nodedown(Nodes, #state{is_master = Master, node_list = NL, cluster_key = K} = S) when is_list(Nodes) ->
-  NL2 = lists:usort(NL -- Nodes),
-  case NL2 =:= NL of
+handle_nodedown(Nodes, #state{node_list = NL, cluster_key = CK} = S) when is_list(Nodes) ->
+  Nodes2 = lists:filter(fun(X) -> not is_remsh_node(X) end, Nodes),
+  case Nodes2 =:= [] of
     true ->
       S;
     false ->
-      ets:insert(?ND_REDIS_ETS, {?NODES_KEY, NL2}),
-      case Master of
-        true ->
-          [redis_q(["SREM", K, erlang:atom_to_list(X)]) || X <- Nodes],
-          notify_node_change({nodedown, node(), Nodes}, NL2);
-        false ->
-          pass
+      NL2 = remove_duplicate(NL -- Nodes2),
+      Node = node(),
+      case lists:max(Nodes2) of
+        Node -> remove_downs(CK, NL2);
+        _ -> pass
       end,
+      ets:insert(?ND_REDIS_ETS, {?NODES_KEY, NL2}),
       S#state{node_list = NL2}
   end.
 
-notify_node_change(Msg, L) ->
-  L2 = lists:filter(fun(X) -> not is_master_node(X) end, L),
-  lists:foreach(fun(X) -> gen_server:cast({?SERVER, X}, Msg) end, L2).
+remove_duplicate(L) ->
+  sets:to_list(sets:from_list(L)).
+
+remove_downs(CK, L) ->
+  L2 = lists:map(fun(X) -> erlang:atom_to_binary(X, utf8) end, L),
+  redis_proxy:q(["SREM", CK | L2]).
+
 
 
