@@ -5,7 +5,6 @@
 %% API
 -export([
   start_link/1,
-  start_link/2,
   q/0,
   q/1
 ]).
@@ -33,11 +32,10 @@
 %%% API
 %%%===================================================================
 
-start_link(CK) ->
-  start_link(?SERVER, CK).
-
-start_link(Name, CK) when is_atom(Name), is_binary(CK) ->
-  gen_server:start_link({local, Name}, ?MODULE, [CK], []).
+start_link(CK) when is_binary(CK) ->
+  gen_server:start_link({local, ?SERVER}, ?MODULE, [CK], []);
+start_link(CK) when is_list(CK) ->
+  gen_server:start_link({local, ?SERVER}, ?MODULE, [unicode:characters_to_binary(CK)], []).
 
 q() ->
   case ets:lookup(?ND_REDIS_ETS, ?NODES_KEY) of
