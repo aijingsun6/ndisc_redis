@@ -1,6 +1,6 @@
 {application, ndisc_redis,
  [{description, "erlang node discover impl by redis"},
-  {vsn, "0.0.2"},
+  {vsn, "0.0.3"},
   {registered, []},
   {mod, {ndisc_redis_app, []}},
   {applications,

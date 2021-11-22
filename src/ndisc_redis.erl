@@ -20,7 +20,6 @@
 ]).
 
 -define(SERVER, ?MODULE).
--define(ND_REDIS_ETS, ndisc_redis_ets).
 -define(NODES_KEY, nodes).
 -record(state, {
   cluster_key,
@@ -38,7 +37,7 @@ start_link(CK) when is_list(CK) ->
   gen_server:start_link({local, ?SERVER}, ?MODULE, [unicode:characters_to_binary(CK)], []).
 
 q() ->
-  case ets:lookup(?ND_REDIS_ETS, ?NODES_KEY) of
+  case ets:lookup(?MODULE, ?NODES_KEY) of
     [{_, L}] -> L;
     [] -> []
   end.
@@ -60,21 +59,22 @@ q(RE) ->
 
 init([CK]) ->
   process_flag(trap_exit, true),
-  ets:new(?ND_REDIS_ETS, [named_table]),
+  ets:new(?MODULE, [named_table, set, protected, {read_concurrency, true}]),
   Node = node(),
-  case is_remsh_node(Node) of
+  Remsh = is_remsh_node(Node),
+  case Remsh of
     true ->
-      {ok, #state{is_remsh = true, cluster_key = CK, node_list = []}};
+      pass;
     false ->
       {ok, _} = redis_proxy:q(["SADD", CK, erlang:atom_to_binary(Node, utf8)]),
-      net_kernel:monitor_nodes(true, [{node_type, all}, nodedown_reason]),
-      {ok, L} = find_nodes_redis(CK),
-      {Live, Dead} = split_nodes(L, [], []),
-      remove_downs(CK, Dead),
-      L2 = remove_duplicate([Node | Live]),
-      ets:insert(?ND_REDIS_ETS, {?NODES_KEY, L2}),
-      {ok, #state{is_remsh = false, cluster_key = CK, node_list = L2}}
-  end.
+      net_kernel:monitor_nodes(true, [{node_type, all}, nodedown_reason])
+  end,
+  {ok, L} = find_nodes_redis(CK),
+  {Live, Dead} = split_nodes(L, [], []),
+  remove_downs(CK, Dead),
+  L2 = remove_duplicate([Node | Live]),
+  ets:insert(?MODULE, {?NODES_KEY, L2}),
+  {ok, #state{is_remsh = Remsh, cluster_key = CK, node_list = L2}}.
 
 handle_call(Request, _From, State) ->
   ?LOG_WARNING("unhandled call msg:~w", [Request]),
@@ -166,7 +166,7 @@ handle_nodeup(Nodes, #state{node_list = NL} = S) when is_list(Nodes) ->
       S;
     false ->
       NL2 = remove_duplicate(NL ++ Nodes2),
-      ets:insert(?ND_REDIS_ETS, {?NODES_KEY, NL2}),
+      ets:insert(?MODULE, {?NODES_KEY, NL2}),
       S#state{node_list = NL2}
   end.
 
@@ -184,7 +184,7 @@ handle_nodedown(Nodes, #state{node_list = NL, cluster_key = CK} = S) when is_lis
         Node -> remove_downs(CK, NL2);
         _ -> pass
       end,
-      ets:insert(?ND_REDIS_ETS, {?NODES_KEY, NL2}),
+      ets:insert(?MODULE, {?NODES_KEY, NL2}),
       S#state{node_list = NL2}
   end.
 
@@ -194,6 +194,4 @@ remove_duplicate(L) ->
 remove_downs(CK, L) ->
   L2 = lists:map(fun(X) -> erlang:atom_to_binary(X, utf8) end, L),
   redis_proxy:q(["SREM", CK | L2]).
-
-
 
